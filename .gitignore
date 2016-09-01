@@ -1,1 +1,4 @@
 files.txt
+ved
+*.o
+.DS_Store
