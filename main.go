@@ -6,7 +6,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/gdamore/tcell/v2"
 )
@@ -101,10 +100,7 @@ func isWordChar(r rune) bool {
 	return r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 }
 
-var sigCont = make(chan os.Signal, 1)
-
 func main() {
-	signal.Notify(sigCont, syscall.SIGCONT)
 	filename := ""
 	if len(os.Args) > 1 {
 		filename = os.Args[1]
@@ -143,16 +139,20 @@ func main() {
 			screen.Sync()
 		case *tcell.EventKey:
 			if ev.Key() == tcell.KeyCtrlZ {
-				screen.Fini() // restore terminal so the shell prompt is clean
+				// Restore the terminal, then reset SIGTSTP to its default
+				// disposition before raising it, so the kernel actually stops
+				// us. If the disposition is left caught/ignored the process
+				// keeps running and the parent shell waits forever.
+				vedlog("ctrl-z: suspending")
+				screen.Fini()
+				vedlog("ctrl-z: screen fini done")
+				signal.Reset(syscall.SIGTSTP)
+				vedlog("ctrl-z: SIGTSTP reset to default, raising now")
 				syscall.Kill(syscall.Getpid(), syscall.SIGTSTP)
-				// Wait for SIGCONT (delivered on resume on a real OS).
-				// If the environment does not implement job-control stop
-				// (sandboxes), fall through after a short grace period.
-				select {
-				case <-sigCont:
-				case <-time.After(500 * time.Millisecond):
-					fmt.Println("ved: suspend not supported in this environment")
-				}
+				vedlog("ctrl-z: returned from kill (should only happen if stop unsupported or SIGCONT resumed)")
+				// On a real OS, execution stops inside Kill and resumes here
+				// after SIGCONT. If stopping is unsupported (sandboxes),
+				// Kill returns immediately and we just repaint.
 				screen.Init()
 				screen.Clear()
 				screen.Sync() // full repaint after resume
