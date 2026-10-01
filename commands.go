@@ -3,9 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
-	"strings"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 type addrParser struct {
@@ -29,7 +29,7 @@ func (a *addrParser) parseOne() (int, error) {
 		switch a.s[a.i] {
 		case '.':
 			a.i++
-			if a.e.CurLine == 0 {
+			if a.e.CurLine == 0 && len(a.buf.Lines) > 0 {
 				return 0, fmt.Errorf("no current line")
 			}
 			base = a.e.CurLine
@@ -114,7 +114,10 @@ func (a *addrParser) parseOne() (int, error) {
 		}
 	}
 	if !have {
-		if a.e.CurLine == 0 {
+		// An empty buffer defaults to address 0 (ed allows `a`/`i` into a
+		// brand-new file; commands like `s` will fail later with a sensible
+		// address error).
+		if a.e.CurLine == 0 && len(a.buf.Lines) > 0 {
 			return 0, fmt.Errorf("no current line")
 		}
 		base = a.e.CurLine
@@ -257,8 +260,20 @@ func ApplyCommand(b *Buffer, e *Engine, text string, live bool) error {
 		e.LastMsg = b.Lines[l1-1]
 		return nil
 	}
+	if len(rest) == 0 {
+		// empty command text (mid-typing preview): no-op
+		return nil
+	}
 	c := rest[0]
-	arg := strings.TrimLeft(rest[1:], " \t")
+	if c == ':' {
+		// extension command: strip the ':' prefix before dispatching
+		rest = strings.TrimLeft(rest[1:], " \t")
+		c = ':'
+	}
+	arg := ""
+	if len(rest) > 1 {
+		arg = strings.TrimLeft(rest[1:], " \t")
+	}
 	switch c {
 	case 'a':
 		b.InsertBefore(l2+1, body)
@@ -468,6 +483,10 @@ func ApplyCommand(b *Buffer, e *Engine, text string, live bool) error {
 			return fmt.Errorf("%s", LastError)
 		}
 		e.QuitRequested = true
+	case ':':
+		// extension commands: :set nu, :set nonu, ...
+		handleExCommand(e, rest, live)
+
 	default:
 		// a bare number is a print command
 		if n, err := strconv.Atoi(cmdline); err == nil {
@@ -544,4 +563,30 @@ func doSubstitute(b *Buffer, arg string, l1, l2 int) error {
 	return nil
 }
 
-
+// handleExCommand parses ':' extension commands. These are display/settings
+// commands with no buffer effect.
+func handleExCommand(e *Engine, rest string, live bool) {
+	arg := strings.TrimSpace(rest)
+	if arg == "" {
+		LastError = "usage: :set nu|nonu|number|nonumber"
+		return
+	}
+	f := strings.Fields(arg)
+	switch f[0] {
+	case "set":
+		if len(f) < 2 {
+			LastError = "usage: :set nu|nonu|number|nonumber"
+			return
+		}
+		switch f[1] {
+		case "nu", "number":
+			e.ShowNumbers = true
+		case "nonu", "nonumber":
+			e.ShowNumbers = false
+		default:
+			LastError = "unknown option: " + f[1]
+		}
+	default:
+		LastError = "unknown command: :" + f[0]
+	}
+}

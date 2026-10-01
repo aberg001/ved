@@ -36,6 +36,7 @@ type Engine struct {
 	WarnedQuit bool
 	QuitRequested bool
 	LastMsg string
+	ShowNumbers bool // display preference: gutter line numbers
 	snapEvery int
 }
 

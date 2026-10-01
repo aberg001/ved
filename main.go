@@ -29,6 +29,9 @@ type UI struct {
 	// of that command until a lone "." is entered.
 	appendMode bool
 	appendIdx  int // index of the command collecting the body
+	// last computed screen position of the editing cursor (set by drawCmdPane)
+	cursorRow int
+	cursorCol int
 }
 
 func (u *UI) kill(text string) {
@@ -550,7 +553,9 @@ func (u *UI) recomputeModified() {
 	eng.WarnedQuit = false
 	mod := false
 	b := eng.Base.Clone()
-	eng.CurLine = 0
+	// start from the same current-line state a live session would have:
+	// last line of the file, like ed at startup.
+	eng.CurLine = len(b.Lines)
 	eng.QuitRequested = false
 	warned := eng.WarnedQuit // live warned state; replay must not clobber it
 	for _, c := range eng.Hist.Cmds {
@@ -562,6 +567,14 @@ func (u *UI) recomputeModified() {
 		}
 		before := b.Clone()
 		ApplyCommand(b, eng, c.Text, false)
+		if LastError != "" {
+			eng.LastMsg = LastError
+		} else if strings.HasPrefix(strings.TrimSpace(c.Text), "s") ||
+			strings.HasPrefix(strings.TrimSpace(c.Text), "m") ||
+			strings.HasPrefix(strings.TrimSpace(c.Text), "t") ||
+			strings.HasPrefix(strings.TrimSpace(c.Text), "d") {
+			eng.LastMsg = ""
+		}
 		if !buffersEqual(b, before) {
 			mod = true
 		}
@@ -647,6 +660,10 @@ func (u *UI) draw() {
 	if viewTop < 0 {
 		viewTop = 0
 	}
+	numW := 0
+	if eng.ShowNumbers {
+		numW = len(fmt.Sprint(len(rows)+1)) + 2 // gutter width: number + two spaces
+	}
 	for r := 0; r < topRows; r++ {
 		idx := viewTop + r
 		if idx >= len(rows) {
@@ -665,7 +682,14 @@ func (u *UI) draw() {
 		default:
 			st = tcell.StyleDefault.Foreground(tcell.ColorDefault)
 		}
-		text := prefix + rl.text
+		gutter := ""
+		if eng.ShowNumbers {
+			n := fmt.Sprintf("%*d", numW-2, idx+1)
+			gs := tcell.StyleDefault.Foreground(tcell.ColorGray)
+			_ = gs
+			gutter = n + "  "
+		}
+		text := gutter + prefix + rl.text
 		var styles []tcell.Style
 		if rl.kind == 0 {
 			styles = LineStyles(rl.text, syn, st)
@@ -691,8 +715,17 @@ func (u *UI) draw() {
 	}
 	drawText(s, 0, statusRow, w, status, statusSt)
 
-	// command pane
+	// command pane; drawCmdPane sets u.cursorRow/u.cursorCol to the edit
+	// position when the edit line is on screen.
+	u.cursorRow = -1
+	u.cursorCol = 4 + u.editCol
 	u.drawCmdPane(statusRow+1, h-statusRow-1, w)
+
+	// editing cursor lives in the command pane
+	if u.cursorRow < 0 {
+		u.cursorRow = statusRow + 1
+	}
+	s.ShowCursor(u.cursorCol, u.cursorRow)
 
 	s.Show()
 }
@@ -734,32 +767,45 @@ func (u *UI) drawCmdPane(top, height, width int) {
 		if i == h.Cursor {
 			continue
 		}
+		if u.appendMode && i == u.appendIdx {
+			// the collecting command's body is rendered by the append block
+			// below; only show its first line here.
+			lines := strings.Split(c.Text, "\n")
+			rows = append(rows, prow{text: fmt.Sprintf("%3d ", i+1) + lines[0], current: false})
+			continue
+		}
 		prompt := fmt.Sprintf("%3d ", i+1)
 		for j, l := range strings.Split(c.Text, "\n") {
 			p := prompt
 			if j > 0 {
-				p = "    "
+				p = "  > "
 			}
 			rows = append(rows, prow{text: p + l, current: false, body: j > 0})
 		}
 	}
 	// current editing command
 	cur := h.Cursor
+	// locate the editing cursor row before building rows (set while appending
+	// editLines below; declared here for the scroll computation)
+	editCursorRow := -1
 	if u.appendMode && u.appendIdx < len(h.Cmds) {
-		// show body lines collected so far above the editing line
+		// show body lines collected so far above the editing line, with '>'
 		for _, l := range strings.Split(h.Cmds[u.appendIdx].Text, "\n")[1:] {
-			rows = append(rows, prow{text: "    " + l, current: true, body: true})
+			rows = append(rows, prow{text: "  > " + l, current: true, body: true})
 		}
 	}
 	for j, l := range u.editLines {
 		p := fmt.Sprintf("%3d ", cur+1)
-		if j > 0 {
-			p = "    "
+		isBody := false
+		if u.appendMode {
+			// body continuation of the collecting command: mark with '>'
+			p = "  > "
+			isBody = true
 		}
+		rows = append(rows, prow{text: p + l, current: true, body: isBody})
 		if j == u.editRow {
-			p = fmt.Sprintf("%3d ", cur+1)
+			editCursorRow = len(rows) - 1
 		}
-		rows = append(rows, prow{text: p + l, current: true})
 	}
 	// scroll so the cursor row is visible
 	curRow := 0
@@ -775,6 +821,15 @@ func (u *UI) drawCmdPane(top, height, width int) {
 	if viewTop < 0 {
 		viewTop = 0
 	}
+	// locate the editing cursor: the line being typed into (tracked above)
+	if editCursorRow >= 0 {
+		if row := top + (editCursorRow - viewTop); row >= top && row < top+height {
+			u.cursorRow = row
+		}
+		prefixLen := 4 // "%3d " prompt width
+		u.cursorCol = prefixLen + u.editCol
+	}
+
 	for r := 0; r < height; r++ {
 		idx := viewTop + r
 		if idx >= len(rows) {
