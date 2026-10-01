@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"golang.org/x/sys/unix"
 	"os"
 	"os/signal"
 	"strings"
@@ -102,8 +103,22 @@ func isWordChar(r rune) bool {
 
 func main() {
 	filename := ""
-	if len(os.Args) > 1 {
-		filename = os.Args[1]
+	execFile := ""
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-e" {
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "ved: -e requires a file argument")
+				os.Exit(1)
+			}
+			i++
+			execFile = args[i]
+		} else if args[i] == "-h" || args[i] == "--help" {
+			fmt.Fprintf(os.Stderr, "usage: ved [-e execfile] [file]\n")
+			os.Exit(0)
+		} else {
+			filename = args[i]
+		}
 	}
 	buf := NewBuffer()
 	if filename != "" {
@@ -115,6 +130,33 @@ func main() {
 		}
 	}
 	eng := NewEngine(filename, buf)
+
+	// Execute an -e command file as though its lines were typed at the end
+	// of the command history. If it doesn't end with q, the commands stay
+	// in the history and the interactive session continues.
+	if execFile != "" {
+		syn := LoadSyntaxDB(syntaxConf)
+		ui := &UI{eng: eng, syn: syn, editLines: []string{""}}
+		data, err := os.ReadFile(execFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ved: %v\n", err)
+			os.Exit(1)
+		}
+		for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+			ui.editLines = []string{line}
+			ui.editRow, ui.editCol = 0, len(line)
+			ui.commit()
+			if ui.quit {
+				eng.QuitRequested = true
+				fmt.Fprintln(os.Stderr, "ved: done")
+				os.Exit(0)
+			}
+			if LastError != "" {
+				fmt.Fprintf(os.Stderr, "ved: %s: %s\n", line, LastError)
+			}
+		}
+	}
+
 	syn := LoadSyntaxDB(syntaxConf)
 
 	screen, err := tcell.NewScreen()
@@ -146,6 +188,16 @@ func main() {
 				vedlog("ctrl-z: suspending")
 				screen.Fini()
 				vedlog("ctrl-z: screen fini done")
+				// Hand the terminal's foreground process group back to the
+				// shell before stopping. Normally the shell does this itself
+				// when it notices the job stopped, but zsh can fail to notice
+				// a self-raised SIGTSTP, leaving the tty with a stopped pgrp
+				// and the shell blocked forever.
+				if err := tcsetpgrpTo(int(os.Stdin.Fd()), os.Getppid()); err != nil {
+					vedlog(fmt.Sprintf("ctrl-z: tcsetpgrp to shell failed: %v", err))
+				} else {
+					vedlog("ctrl-z: tty handed back to shell pgrp")
+				}
 				signal.Reset(syscall.SIGTSTP)
 				vedlog("ctrl-z: SIGTSTP reset to default, raising now")
 				syscall.Kill(syscall.Getpid(), syscall.SIGTSTP)
@@ -153,6 +205,12 @@ func main() {
 				// On a real OS, execution stops inside Kill and resumes here
 				// after SIGCONT. If stopping is unsupported (sandboxes),
 				// Kill returns immediately and we just repaint.
+				// Reclaim the terminal foreground pgrp now that we're resumed.
+				if err := tcsetpgrpTo(int(os.Stdin.Fd()), unix.Getpgrp()); err != nil {
+					vedlog(fmt.Sprintf("resume: tcsetpgrp to self failed: %v", err))
+				} else {
+					vedlog("resume: tty reclaimed")
+				}
 				screen.Init()
 				screen.Clear()
 				screen.Sync() // full repaint after resume
@@ -462,8 +520,20 @@ func (u *UI) commit() {
 	// recompute modified flag: run the timeline with file effects allowed
 	u.recomputeModified()
 	eng.MaybeSnapshot()
-	// check for quit
-	if eng.QuitRequested {
+	// live quit semantics, like ed: plain q warns once on a modified buffer
+	t := strings.TrimSpace(text)
+	if t == "Q" || t == "Q!" || t == "q!" {
+		u.quit = true
+		return
+	}
+	if t == "q" {
+		if eng.Modified && !eng.WarnedQuit {
+			eng.WarnedQuit = true
+			LastError = "warning: buffer modified (use Q to force); q again to quit"
+			u.editLines = []string{""}
+			u.editRow, u.editCol = 0, 0
+			return
+		}
 		u.quit = true
 		return
 	}
@@ -482,7 +552,14 @@ func (u *UI) recomputeModified() {
 	b := eng.Base.Clone()
 	eng.CurLine = 0
 	eng.QuitRequested = false
+	warned := eng.WarnedQuit // live warned state; replay must not clobber it
 	for _, c := range eng.Hist.Cmds {
+		// q/Q have no buffer effect; quit semantics are handled at the
+		// live commit layer, not during the modified-flag replay.
+		t := strings.TrimSpace(c.Text)
+		if t == "q" || t == "Q" || t == "q!" || t == "Q!" {
+			continue
+		}
 		before := b.Clone()
 		ApplyCommand(b, eng, c.Text, false)
 		if !buffersEqual(b, before) {
@@ -497,6 +574,7 @@ func (u *UI) recomputeModified() {
 		}
 	}
 	eng.Modified = mod
+	eng.WarnedQuit = warned
 }
 
 // previewBuffer returns the buffer to display in the top pane.
