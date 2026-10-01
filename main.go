@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"golang.org/x/sys/unix"
 	"os"
+	"path/filepath"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -29,6 +30,12 @@ type UI struct {
 	// of that command until a lone "." is entered.
 	appendMode bool
 	appendIdx  int // index of the command collecting the body
+	// editing the body of an existing a/i/c command (left collect mode via
+	// up-arrow, or mid-body editing); Enter adds lines, Down exits
+	editingBody bool
+	// quiet: commands committed while set are marked Hidden (not shown in
+	// history) — used when executing ~/.vedrc at startup
+	quiet bool
 	// last computed screen position of the editing cursor (set by drawCmdPane)
 	cursorRow int
 	cursorCol int
@@ -174,6 +181,26 @@ func main() {
 	defer screen.Fini()
 
 	ui := &UI{screen: screen, eng: eng, syn: syn, editLines: []string{""}}
+
+	// Execute ~/.vedrc lines silently at startup: commands apply (settings
+	// like :set nu take effect) but are marked Hidden so they never show in
+	// the command history pane. Errors are reported on the status line and
+	// don't stop the session.
+	if home, err := os.UserHomeDir(); err == nil {
+		if data, err := os.ReadFile(filepath.Join(home, ".vedrc")); err == nil {
+			for _, line := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+				if strings.TrimSpace(line) == "" {
+					continue
+				}
+				ui.editLines = []string{line}
+				ui.editRow, ui.editCol = 0, len(line)
+				ui.quiet = true
+				ui.commit()
+				ui.quiet = false
+			}
+		}
+	}
+
 	screen.SetStyle(tcell.StyleDefault.Background(tcell.ColorDefault).Foreground(tcell.ColorDefault))
 
 	for !ui.quit {
@@ -301,10 +328,25 @@ func (u *UI) handleKey(ev *tcell.EventKey) {
 		if u.editRow > 0 {
 			u.editRow--
 			u.editCol = len([]rune(u.editLines[u.editRow]))
+		} else if u.appendMode {
+			// moving up out of the append edit: open the collecting command
+			// (which holds the body committed so far) for editing
+			u.historyUp()
+			u.appendMode = false
+			u.editingBody = true
+			u.editRow = len(u.editLines) - 1
+			if u.editRow < 0 {
+				u.editRow = 0
+			}
+			u.editCol = len([]rune(u.editLines[u.editRow]))
 		} else {
 			u.historyUp()
 		}
 	case tcell.KeyCtrlN, tcell.KeyDown:
+		if u.editingBody {
+			// Down leaves body editing: save the text and return to command mode
+			u.editingBody = false
+		}
 		if u.editRow < len(u.editLines)-1 {
 			u.editRow++
 			u.editCol = len([]rune(u.editLines[u.editRow]))
@@ -391,6 +433,24 @@ func (u *UI) handleKey(ev *tcell.EventKey) {
 		u.editCol++
 		u.editLines[u.editRow] = line
 	case tcell.KeyEnter:
+		if u.editingBody {
+			line := u.editLines[u.editRow]
+			if strings.TrimSpace(line) == "." {
+				// lone "." terminates the body: commit the command
+				u.editingBody = false
+				u.commit()
+				return
+			}
+			// insert a line break at the cursor, like collect mode
+			rr := []rune(line)
+			u.editLines[u.editRow] = string(rr[:u.editCol])
+			next := string(rr[u.editCol:])
+			u.editLines = append(u.editLines[:u.editRow+1],
+				append([]string{next}, u.editLines[u.editRow+1:]...)...)
+			u.editRow++
+			u.editCol = len([]rune(next))
+			return
+		}
 		u.commit()
 	}
 }
@@ -399,6 +459,9 @@ func (u *UI) handleKey(ev *tcell.EventKey) {
 func (u *UI) historyUp() {
 	eng := u.eng
 	h := &eng.Hist
+	for h.Cursor > 0 && h.Cmds[h.Cursor-1].Hidden {
+		h.Cursor--
+	}
 	if h.Cursor == 0 {
 		return
 	}
@@ -416,6 +479,9 @@ func (u *UI) historyDown() {
 	// if the current command text was modified, save it first
 	h.Cmds[h.Cursor].Text = u.currentEdit()
 	h.Cursor++
+	for h.Cursor < len(h.Cmds) && h.Cmds[h.Cursor].Hidden {
+		h.Cursor++
+	}
 	if h.Cursor == len(h.Cmds) {
 		u.editLines = []string{""}
 		u.editRow = 0
@@ -507,13 +573,21 @@ func (u *UI) commit() {
 		if strings.TrimSpace(text) == "" {
 			return
 		}
-		h.Cmds = append(h.Cmds, Command{Text: text})
+		// a lone "." at the command prompt is a no-op in ed
+		if strings.TrimSpace(text) == "." {
+			return
+		}
+		c := Command{Text: text, Hidden: u.quiet}
+		h.Cmds = append(h.Cmds, c)
 		h.Cursor = len(h.Cmds)
 	}
 	vedlog(fmt.Sprintf("commit: cursor=%d len=%d text=%q appendMode=%v", h.Cursor, len(h.Cmds), text, u.appendMode))
+	wasBodyEdit := u.editingBody
+	u.editingBody = false
 	// if this command consumes a body, enter append mode so subsequent
-	// lines are folded in until "."
-	if u.appendIdx = h.Cursor - 1; cmdTakesBody(text) {
+	// lines are folded in until "." (only for freshly appended commands,
+	// not spliced edits of existing body commands)
+	if u.appendIdx = h.Cursor - 1; !wasBodyEdit && h.Cursor == len(h.Cmds) && cmdTakesBody(text) {
 		u.appendMode = true
 		u.editLines = []string{""}
 		u.editRow, u.editCol = 0, 0
@@ -533,6 +607,7 @@ func (u *UI) commit() {
 		if eng.Modified && !eng.WarnedQuit {
 			eng.WarnedQuit = true
 			LastError = "warning: buffer modified (use Q to force); q again to quit"
+			eng.LastMsg = LastError
 			u.editLines = []string{""}
 			u.editRow, u.editCol = 0, 0
 			return
@@ -550,6 +625,7 @@ func (u *UI) commit() {
 // to keep the Modified flag honest.
 func (u *UI) recomputeModified() {
 	eng := u.eng
+	warned := eng.WarnedQuit // live warned state; replay must not clobber it
 	eng.WarnedQuit = false
 	mod := false
 	b := eng.Base.Clone()
@@ -557,7 +633,6 @@ func (u *UI) recomputeModified() {
 	// last line of the file, like ed at startup.
 	eng.CurLine = len(b.Lines)
 	eng.QuitRequested = false
-	warned := eng.WarnedQuit // live warned state; replay must not clobber it
 	for _, c := range eng.Hist.Cmds {
 		// q/Q have no buffer effect; quit semantics are handled at the
 		// live commit layer, not during the modified-flag replay.
@@ -664,47 +739,69 @@ func (u *UI) draw() {
 	if eng.ShowNumbers {
 		numW = len(fmt.Sprint(len(rows)+1)) + 2 // gutter width: number + two spaces
 	}
+	// dot highlight style: subtle background for the current line
+	dotBg := tcell.ColorDarkSlateGray
 	for r := 0; r < topRows; r++ {
 		idx := viewTop + r
 		if idx >= len(rows) {
 			break
 		}
 		rl := rows[idx]
-		st := tcell.StyleDefault
+		isDot := rl.lineNum == eng.CurLine && eng.CurLine > 0
+		numSt := tcell.StyleDefault.Foreground(tcell.ColorSteelBlue)
+		var bodySt tcell.Style
+		switch rl.kind {
+		case 1:
+			bodySt = tcell.StyleDefault.Foreground(tcell.ColorRed)
+		case 2:
+			bodySt = tcell.StyleDefault.Foreground(tcell.ColorGreen)
+		default:
+			bodySt = tcell.StyleDefault.Foreground(tcell.ColorDefault)
+		}
 		prefix := ""
 		switch rl.kind {
 		case 1:
-			st = st.Foreground(tcell.ColorRed)
 			prefix = "- "
 		case 2:
-			st = st.Foreground(tcell.ColorGreen)
 			prefix = "+ "
-		default:
-			st = tcell.StyleDefault.Foreground(tcell.ColorDefault)
+		}
+		if isDot {
+			numSt = numSt.Background(dotBg)
+			bodySt = bodySt.Background(dotBg)
 		}
 		gutter := ""
 		if eng.ShowNumbers {
 			n := fmt.Sprintf("%*d", numW-2, idx+1)
-			gs := tcell.StyleDefault.Foreground(tcell.ColorGray)
-			_ = gs
 			gutter = n + "  "
 		}
 		text := gutter + prefix + rl.text
-		var styles []tcell.Style
-		if rl.kind == 0 {
-			styles = LineStyles(rl.text, syn, st)
+		// build per-cell styles: gutter, prefix, then syntax styles for body
+		styles := make([]tcell.Style, len(text))
+		for i := range styles {
+			st := bodySt
+			if i < len(gutter) {
+				st = numSt
+			} else if i < len(gutter)+len(prefix) {
+				st = bodySt
+			} else if rl.kind == 0 {
+				st = LineStyles(rl.text, syn, bodySt)[i-len(gutter)-len(prefix)]
+			}
+			styles[i] = st
 		}
-		drawStyledLine(s, 0, r, w, text, styles, st, rl.kind == 0)
+		drawStyledLine(s, 0, r, w, text, styles, bodySt, true)
 	}
 	if len(rows) == 0 && topRows > 0 {
 		// empty buffer
 	}
 
-	// status line
+	// status line; red when showing an error/warning (LastMsg mirrors LastError)
 	statusSt := tcell.StyleDefault.Background(tcell.ColorDarkBlue).Foreground(tcell.ColorWhite)
-	status := fmt.Sprintf(" %s%s | %d lines, %d words, %d chars | cur %d | cmd %d/%d",
+	if eng.LastMsg != "" && eng.LastMsg == LastError {
+		statusSt = tcell.StyleDefault.Background(tcell.ColorDarkRed).Foreground(tcell.ColorWhite).Bold(true)
+	}
+	status := fmt.Sprintf(" %s%s | %d lines, %d words, %d chars | cmd %d/%d",
 		eng.Filename, modMark(eng.Modified), preview.NumLines(), preview.WordCount(),
-		preview.CharCount(), eng.CurLine, u.eng.Hist.Cursor, len(u.eng.Hist.Cmds))
+		preview.CharCount(), u.eng.Hist.Cursor, len(u.eng.Hist.Cmds))
 	if eng.LastMsg != "" {
 		status = " " + eng.LastMsg
 	}
@@ -763,48 +860,61 @@ func (u *UI) drawCmdPane(top, height, width int) {
 		body    bool
 	}
 	var rows []prow
-	for i, c := range h.Cmds {
-		if i == h.Cursor {
+	// editing cursor row (set while building the current command's rows)
+	editCursorRow := -1
+	num := 0 // visible command number (hidden rc commands don't count)
+	for i := 0; i <= len(h.Cmds); i++ {
+		if i < len(h.Cmds) && h.Cmds[i].Hidden && i != h.Cursor {
 			continue
 		}
+		if i < len(h.Cmds) {
+			num++
+		}
+		if i == h.Cursor {
+			// the command being edited (or the prompt) renders at its position
+			if u.appendMode && u.appendIdx == h.Cursor-1 && h.Cursor-1 < len(h.Cmds) {
+				// collecting: stored body (minus first line) shown above,
+				// the first line comes as part of editLines[0]
+				bodyLines := strings.Split(h.Cmds[h.Cursor-1].Text, "\n")[1:]
+				for _, l := range bodyLines {
+					rows = append(rows, prow{text: "  > " + l, current: true, body: true})
+				}
+			}
+			for j, l := range u.editLines {
+				n := num
+				if i == len(h.Cmds) {
+					n = num + 1 // prompt shows the next command's number
+				}
+				p := fmt.Sprintf("%3d ", n)
+				isBody := j > 0
+				if u.appendMode || u.editingBody || isBody {
+					p = "  > "
+				}
+				rows = append(rows, prow{text: p + l, current: true, body: isBody})
+				if j == u.editRow {
+					editCursorRow = len(rows) - 1
+				}
+			}
+			continue
+		}
+		if i == len(h.Cmds) {
+			break
+		}
+		c := h.Cmds[i]
 		if u.appendMode && i == u.appendIdx {
 			// the collecting command's body is rendered by the append block
 			// below; only show its first line here.
 			lines := strings.Split(c.Text, "\n")
-			rows = append(rows, prow{text: fmt.Sprintf("%3d ", i+1) + lines[0], current: false})
+			rows = append(rows, prow{text: fmt.Sprintf("%3d ", num) + lines[0], current: false})
 			continue
 		}
-		prompt := fmt.Sprintf("%3d ", i+1)
+		prompt := fmt.Sprintf("%3d ", num)
 		for j, l := range strings.Split(c.Text, "\n") {
 			p := prompt
 			if j > 0 {
 				p = "  > "
 			}
 			rows = append(rows, prow{text: p + l, current: false, body: j > 0})
-		}
-	}
-	// current editing command
-	cur := h.Cursor
-	// locate the editing cursor row before building rows (set while appending
-	// editLines below; declared here for the scroll computation)
-	editCursorRow := -1
-	if u.appendMode && u.appendIdx < len(h.Cmds) {
-		// show body lines collected so far above the editing line, with '>'
-		for _, l := range strings.Split(h.Cmds[u.appendIdx].Text, "\n")[1:] {
-			rows = append(rows, prow{text: "  > " + l, current: true, body: true})
-		}
-	}
-	for j, l := range u.editLines {
-		p := fmt.Sprintf("%3d ", cur+1)
-		isBody := false
-		if u.appendMode {
-			// body continuation of the collecting command: mark with '>'
-			p = "  > "
-			isBody = true
-		}
-		rows = append(rows, prow{text: p + l, current: true, body: isBody})
-		if j == u.editRow {
-			editCursorRow = len(rows) - 1
 		}
 	}
 	// scroll so the cursor row is visible

@@ -8,6 +8,9 @@ type Command struct {
 	Text string
 	// Err records an execution error so re-running during replay surfaces it.
 	Err string
+	// Hidden marks commands executed silently (e.g. from ~/.vedrc): applied
+	// by replay but not shown in the command history pane.
+	Hidden bool
 }
 
 // History is a linear list of commands plus a cursor. cursor == len(cmds)
@@ -54,6 +57,10 @@ func NewEngine(filename string, b *Buffer) *Engine {
 // StateAt returns the buffer after commands [0..n] have been applied.
 func (e *Engine) StateAt(n int) *Buffer {
 	// find nearest snapshot at or before n
+	// replay must not clobber the live LastError or LastMsg (e.g. the q warning)
+	saved := LastError
+	savedMsg := e.LastMsg
+	defer func() { LastError = saved; e.LastMsg = savedMsg }()
 	si := 0
 	for i, s := range e.Snapshots {
 		if s.AfterIndex <= n {
@@ -72,6 +79,9 @@ func (e *Engine) StateAt(n int) *Buffer {
 // StateAtPreview is StateAt but with the given text substituted for the
 // command at index i (used for live edit preview). i must be < len(cmds).
 func (e *Engine) StateAtPreview(i int, text string) *Buffer {
+	saved := LastError
+	savedMsg := e.LastMsg
+	defer func() { LastError = saved; e.LastMsg = savedMsg }()
 	if i >= len(e.Hist.Cmds) {
 		// editing the fresh line: apply new text after all commands
 		b := e.StateAt(len(e.Hist.Cmds) - 1)

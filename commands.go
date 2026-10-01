@@ -313,6 +313,10 @@ func ApplyCommand(b *Buffer, e *Engine, text string, live bool) error {
 			}
 		}
 	case 'm':
+		if l1 < 1 || l2 > len(b.Lines) {
+			LastError = "address out of range"
+			return fmt.Errorf("%s", LastError)
+		}
 		dest, err := parseSingle(arg, e, b)
 		if err != nil {
 			LastError = err.Error()
