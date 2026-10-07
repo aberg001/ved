@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"unicode/utf8"
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
@@ -131,9 +132,27 @@ func LineStyles(line string, syn *Syntax, defStyle tcell.Style) []tcell.Style {
 	if syn == nil {
 		return styles
 	}
+	// regex offsets are byte-based; map them to rune indices so styles stay
+	// parallel to runes even with multibyte text
+	byteToRune := make([]int, len(line)+1)
+	bi, ri := 0, 0
+	for bi <= len(line) {
+		byteToRune[bi] = ri
+		if bi == len(line) {
+			break
+		}
+		_, sz := utf8.DecodeRuneInString(line[bi:])
+		if sz == 0 {
+			sz = 1
+		}
+		bi += sz
+		ri++
+	}
 	for _, r := range syn.Rules {
 		for _, loc := range r.Re.FindAllStringIndex(line, -1) {
-			for i := loc[0]; i < loc[1] && i < len(runes); i++ {
+			a := byteToRune[loc[0]]
+			b := byteToRune[loc[1]]
+			for i := a; i < b && i < len(runes); i++ {
 				styles[i] = r.Style
 			}
 		}

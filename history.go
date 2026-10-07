@@ -25,6 +25,7 @@ type History struct {
 type Snapshot struct {
 	AfterIndex int // buffer state after commands [0..AfterIndex] applied
 	Buf        *Buffer
+	Dot        int // current address (1-based) after those commands
 }
 
 // Engine holds buffer, history, snapshots, and current addresses.
@@ -34,12 +35,15 @@ type Engine struct {
 	Hist      History
 	Snapshots []Snapshot // snapshots[0] = base (AfterIndex -1)
 	CurLine   int        // current address (1-based); 0 = none
+	Replay    *int       // during replay: dot lives here, not CurLine
 	LastRegex string
 	Modified bool
 	WarnedQuit bool
 	QuitRequested bool
 	LastMsg string
 	ShowNumbers bool // display preference: gutter line numbers
+	Marks map[byte]int // named marks set by k, addressed with 'x
+	HMode bool // auto-print error messages (H toggle)
 	snapEvery int
 }
 
@@ -48,10 +52,28 @@ func NewEngine(filename string, b *Buffer) *Engine {
 		Filename:  filename,
 		Base:      b.Clone(),
 		CurLine:   len(b.Lines),
+		Marks:     map[byte]int{},
 		snapEvery: 16,
 	}
-	e.Snapshots = []Snapshot{{AfterIndex: -1, Buf: b.Clone()}}
+	e.Snapshots = []Snapshot{{AfterIndex: -1, Buf: b.Clone(), Dot: len(b.Lines)}}
 	return e
+}
+
+// getDot returns the current address: the replay cursor when replaying,
+// otherwise the live dot.
+func (e *Engine) getDot() int {
+	if e.Replay != nil {
+		return *e.Replay
+	}
+	return e.CurLine
+}
+
+// setDot sets the current address for both live and replay contexts.
+func (e *Engine) setDot(n int) {
+	if e.Replay != nil {
+		*e.Replay = n
+	}
+	e.CurLine = n
 }
 
 // StateAt returns the buffer after commands [0..n] have been applied.
@@ -70,6 +92,9 @@ func (e *Engine) StateAt(n int) *Buffer {
 		}
 	}
 	b := e.Snapshots[si].Buf.Clone()
+	dot := e.Snapshots[si].Dot
+	e.Replay = &dot
+	defer func() { e.Replay = nil }()
 	for i := e.Snapshots[si].AfterIndex + 1; i <= n && i < len(e.Hist.Cmds); i++ {
 		ApplyCommand(b, e, e.Hist.Cmds[i].Text, true)
 	}
@@ -108,12 +133,13 @@ func (e *Engine) StateAtPreview(i int, text string) *Buffer {
 	return b
 }
 
-// MaybeSnapshot records a snapshot every snapEvery commands.
+// MaybeSnapshot records a snapshot every snapEvery commands. Called on the
+// live path: the live buffer and dot ARE the state after len(Cmds)-1.
 func (e *Engine) MaybeSnapshot() {
 	n := len(e.Hist.Cmds) - 1
 	last := e.Snapshots[len(e.Snapshots)-1].AfterIndex
 	if n-last >= e.snapEvery {
-		e.Snapshots = append(e.Snapshots, Snapshot{AfterIndex: n, Buf: e.StateAt(n)})
+		e.Snapshots = append(e.Snapshots, Snapshot{AfterIndex: n, Buf: e.StateAt(n), Dot: e.CurLine})
 	}
 }
 

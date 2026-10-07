@@ -72,3 +72,22 @@ func TestDiffLine(t *testing.T) {
 		t.Fatalf("want 2 changes, got %d: %+v", len(cs), cs)
 	}
 }
+
+func TestExHelp(t *testing.T) {
+	e := NewEngine("t", &Buffer{})
+	handleExCommand(e, "help i", false)
+	if !strings.Contains(e.LastMsg, "insert text before") {
+		t.Fatalf("help i: %q", e.LastMsg)
+	}
+	handleExCommand(e, "help", false)
+	if !strings.Contains(e.LastMsg, "commands:") {
+		t.Fatalf("bare help: %q", e.LastMsg)
+	}
+	if !strings.Contains(e.LastMsg, " m ") {
+		t.Fatalf("bare help lists commands: %q", e.LastMsg)
+	}
+	handleExCommand(e, "help nope", false)
+	if !strings.Contains(LastError, "no help for: nope") {
+		t.Fatalf("unknown topic: LastError=%q", LastError)
+	}
+}

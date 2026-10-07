@@ -247,6 +247,9 @@ func main() {
 				continue
 			}
 			ui.handleKey(ev)
+			if ui.quit {
+				break
+			}
 		}
 	}
 }
@@ -436,7 +439,17 @@ func (u *UI) handleKey(ev *tcell.EventKey) {
 		if u.editingBody {
 			line := u.editLines[u.editRow]
 			if strings.TrimSpace(line) == "." {
-				// lone "." terminates the body: commit the command
+				// lone "." terminates the body: drop it, then commit
+				if u.editRow > 0 {
+					u.editLines = u.editLines[:u.editRow]
+					u.editRow--
+					u.editCol = len([]rune(u.editLines[u.editRow]))
+				} else {
+					u.editLines = u.editLines[1:]
+				}
+				if len(u.editLines) == 0 {
+					u.editLines = []string{""}
+				}
 				u.editingBody = false
 				u.commit()
 				return
@@ -500,6 +513,8 @@ func (u *UI) loadCurrent() {
 		if len(u.editLines) == 0 {
 			u.editLines = []string{""}
 		}
+		// editing a body command (a/i/c): Enter inserts lines, Down exits
+		u.editingBody = cmdTakesBody(u.editLines[0])
 		u.editRow = len(u.editLines) - 1
 		u.editCol = len([]rune(u.editLines[u.editRow]))
 	}
@@ -531,6 +546,22 @@ func cmdTakesBody(text string) bool {
 		(len(rest) == 1 || rest[1] == ' ' || rest[1] == '\t') {
 		return true
 	}
+	// G/V (interactive global) collect one response per matching line
+	if len(rest) >= 2 && (rest[0] == 'G' || rest[0] == 'V') &&
+		(rest[1] == '/' || rest[1] == '?' || rest[1] == '%' || rest[1] == ':') {
+		return true
+	}
+	// g/v whose tail command is a/i/c collects a body for it
+	if len(rest) >= 1 && (rest[0] == 'g' || rest[0] == 'v') && len(rest) > 1 {
+		delim := rest[1]
+		if j := strings.IndexByte(rest[2:], delim); j >= 0 {
+			tail := strings.TrimLeft(rest[2+j+1:], " \t")
+			if len(tail) >= 1 && (tail[0] == 'a' || tail[0] == 'i' || tail[0] == 'c') &&
+				(len(tail) == 1 || tail[1] == ' ' || tail[1] == '\t') {
+				return true
+			}
+		}
+	}
 	return false
 }
 
@@ -538,6 +569,25 @@ func (u *UI) commit() {
 	eng := u.eng
 	h := &eng.Hist
 	text := u.currentEdit()
+
+	// live-only undo: pop the last non-hidden command from the timeline.
+	// Replay then recomputes the buffer without it. Never stored in history,
+	// so replay never sees a 'u' command.
+	if strings.TrimSpace(text) == "u" && h.Cursor == len(h.Cmds) && len(h.Cmds) > 0 {
+		for i := len(h.Cmds) - 1; i >= 0; i-- {
+			if !h.Cmds[i].Hidden {
+				h.Cmds = h.Cmds[:i]
+				h.Cursor = len(h.Cmds)
+				break
+			}
+		}
+		u.editLines = []string{""}
+		u.editRow, u.editCol = 0, 0
+		u.recomputeModified()
+		eng.MaybeSnapshot()
+		eng.LastMsg = ""
+		return
+	}
 
 	// append mode: fold the line into the collecting command body
 	if u.appendMode {
@@ -581,7 +631,6 @@ func (u *UI) commit() {
 		h.Cmds = append(h.Cmds, c)
 		h.Cursor = len(h.Cmds)
 	}
-	vedlog(fmt.Sprintf("commit: cursor=%d len=%d text=%q appendMode=%v", h.Cursor, len(h.Cmds), text, u.appendMode))
 	wasBodyEdit := u.editingBody
 	u.editingBody = false
 	// if this command consumes a body, enter append mode so subsequent
@@ -621,6 +670,25 @@ func (u *UI) commit() {
 	u.editCol = 0
 }
 
+// foldBodyEntries joins a body-taking command's following history entries
+// into one multi-line text, stopping at the terminating ".". Live storage
+// keeps one entry per line, but ApplyCommand wants the whole form. Returns
+// the folded text and the next index to resume at (i+1 when no folding).
+func foldBodyEntries(cmds []Command, i int) (string, int) {
+	text := cmds[i].Text
+	if !cmdTakesBody(text) || strings.Contains(text, "\n") {
+		return text, i + 1
+	}
+	for i+1 < len(cmds) {
+		i++
+		text += "\n" + cmds[i].Text
+		if strings.TrimSpace(cmds[i].Text) == "." {
+			break
+		}
+	}
+	return text, i + 1
+}
+
 // recomputeModified replays the timeline from Base, honoring w/e/r effects,
 // to keep the Modified flag honest.
 func (u *UI) recomputeModified() {
@@ -633,7 +701,10 @@ func (u *UI) recomputeModified() {
 	// last line of the file, like ed at startup.
 	eng.CurLine = len(b.Lines)
 	eng.QuitRequested = false
-	for _, c := range eng.Hist.Cmds {
+	for i := 0; i < len(eng.Hist.Cmds); i++ {
+		c := eng.Hist.Cmds[i]
+		text, next := foldBodyEntries(eng.Hist.Cmds, i)
+		i = next - 1
 		// q/Q have no buffer effect; quit semantics are handled at the
 		// live commit layer, not during the modified-flag replay.
 		t := strings.TrimSpace(c.Text)
@@ -641,7 +712,7 @@ func (u *UI) recomputeModified() {
 			continue
 		}
 		before := b.Clone()
-		ApplyCommand(b, eng, c.Text, false)
+		ApplyCommand(b, eng, text, false)
 		if LastError != "" {
 			eng.LastMsg = LastError
 		} else if strings.HasPrefix(strings.TrimSpace(c.Text), "s") ||
@@ -774,21 +845,37 @@ func (u *UI) draw() {
 			n := fmt.Sprintf("%*d", numW-2, idx+1)
 			gutter = n + "  "
 		}
-		text := gutter + prefix + rl.text
-		// build per-cell styles: gutter, prefix, then syntax styles for body
-		styles := make([]tcell.Style, len(text))
+		// Style only what can be shown: styling a very long line is wasted
+		// work (and can freeze the UI under GC pressure).
+		visText := rl.text
+		if avail := w - len(gutter) - len(prefix); avail > 0 {
+			if r := []rune(visText); len(r) > avail {
+				visText = string(r[:avail])
+			}
+		} else {
+			visText = ""
+		}
+		// build per-cell styles in rune space: LineStyles indexes by rune,
+		// so mixing byte offsets with multibyte text misaligns (and panics).
+		rrunes := []rune(gutter)
+		gutterR := len(rrunes)
+		rrunes = append(rrunes, []rune(prefix)...)
+		prefixR := len(rrunes)
+		bodyStyles := LineStyles(visText, syn, bodySt)
+		rrunes = append(rrunes, []rune(visText)...)
+		styles := make([]tcell.Style, len(rrunes))
 		for i := range styles {
 			st := bodySt
-			if i < len(gutter) {
+			if i < gutterR {
 				st = numSt
-			} else if i < len(gutter)+len(prefix) {
+			} else if i < prefixR {
 				st = bodySt
 			} else if rl.kind == 0 {
-				st = LineStyles(rl.text, syn, bodySt)[i-len(gutter)-len(prefix)]
+				st = bodyStyles[i-prefixR]
 			}
 			styles[i] = st
 		}
-		drawStyledLine(s, 0, r, w, text, styles, bodySt, true)
+		drawStyledLine(s, 0, r, w, string(rrunes), styles, bodySt, true)
 	}
 	if len(rows) == 0 && topRows > 0 {
 		// empty buffer
@@ -804,6 +891,9 @@ func (u *UI) draw() {
 		preview.CharCount(), u.eng.Hist.Cursor, len(u.eng.Hist.Cmds))
 	if eng.LastMsg != "" {
 		status = " " + eng.LastMsg
+		if r := []rune(status); len(r) > w {
+			status = string(r[:w])
+		}
 	}
 	for x := 0; x < w; x++ {
 		r, _, _ := statusSt.Decompose()
