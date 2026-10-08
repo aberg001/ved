@@ -255,6 +255,7 @@ func ApplyCommand(b *Buffer, e *Engine, text string, live bool) error {
 }
 
 func applyCommand(b *Buffer, e *Engine, text string, live bool) error {
+	e.LastMove = nil // only m/t set it; everything else invalidates the hint
 	lines := strings.Split(text, "\n")
 	// trim a single trailing "" if text ended with \n
 	if len(lines) > 1 && lines[len(lines)-1] == "" {
@@ -349,10 +350,16 @@ func applyCommand(b *Buffer, e *Engine, text string, live bool) error {
 			LastError = err.Error()
 			return err
 		}
+		if err := checkDest(dest, b); err != nil {
+			LastError = err.Error()
+			return err
+		}
 		if dest >= l1 && dest <= l2 {
 			LastError = "invalid destination"
 			return fmt.Errorf("%s", LastError)
 		}
+		origDest := dest
+		e.LastMsg = fmt.Sprintf("moved %d-%d after %d", l1, l2, dest)
 		moved := make([]string, l2-l1+1)
 		copy(moved, b.Lines[l1-1:l2])
 		b.Delete(l1, l2)
@@ -365,12 +372,19 @@ func applyCommand(b *Buffer, e *Engine, text string, live bool) error {
 			e.setDot(dest + (l2 - l1 + 1))
 			e.Modified = true
 		}
+		e.LastMove = &MoveInfo{L1: l1, L2: l2, Dest: origDest, Copy: false}
 	case 't':
 		dest, err := parseSingle(arg, e, b)
 		if err != nil {
 			LastError = err.Error()
 			return err
 		}
+		if err := checkDest(dest, b); err != nil {
+			LastError = err.Error()
+			return err
+		}
+		e.LastMove = nil
+		e.LastMsg = fmt.Sprintf("copied %d-%d after %d", l1, l2, dest)
 		cp := make([]string, l2-l1+1)
 		copy(cp, b.Lines[l1-1:l2])
 		b.InsertBefore(dest+1, cp)
@@ -378,6 +392,7 @@ func applyCommand(b *Buffer, e *Engine, text string, live bool) error {
 			e.setDot(dest + len(cp))
 			e.Modified = true
 		}
+		e.LastMove = &MoveInfo{L1: l1, L2: l2, Dest: dest, Copy: true}
 	case 's':
 		if l1 < 1 || l2 > len(b.Lines) {
 			LastError = "address out of range"
@@ -721,50 +736,120 @@ func parseSingle(arg string, e *Engine, b *Buffer) (int, error) {
 	return ap.parseOne()
 }
 
+// checkDest validates a move/copy destination: 0 (top) through
+// len(b.Lines) (after the last line) are legal; anything else is not.
+func checkDest(dest int, b *Buffer) error {
+	if dest < 0 || dest > len(b.Lines) {
+		return fmt.Errorf("address out of range")
+	}
+	return nil
+}
+
 func doSubstitute(b *Buffer, arg string, l1, l2 int) error {
 	if arg == "" {
 		return fmt.Errorf("s: missing pattern")
 	}
 	delim := arg[0]
 	rest := arg[1:]
-	idx := strings.IndexByte(rest, delim)
-	if idx < 0 {
-		return fmt.Errorf("s: unterminated pattern")
+
+	// split on the first UNESCAPED delimiter; \\ escapes any char
+	split := func(s string) (field, remainder string, esc bool) {
+		var sb strings.Builder
+		for i := 0; i < len(s); i++ {
+			if s[i] == '\\' && i+1 < len(s) {
+				// keep the escape pair as-is; translation happens later
+				sb.WriteByte('\\')
+				sb.WriteByte(s[i+1])
+				i++
+				continue
+			}
+			if s[i] == delim {
+				return sb.String(), s[i+1:], true
+			}
+			sb.WriteByte(s[i])
+		}
+		return sb.String(), s, false
 	}
-	pat := rest[:idx]
-	tail := rest[idx+1:]
-	end := strings.IndexByte(tail, delim)
-	var repl, flags string
-	if end < 0 {
+
+	pat, tail, _ := split(rest)
+	repl, flags, ended := split(tail)
+	if !ended {
 		// still being typed: pattern complete, replacement is whatever
 		// is on screen so far, no flags yet
-		repl, flags = tail, ""
-	} else {
-		repl, flags = tail[:end], tail[end+1:]
+		flags = ""
+	}
+
+	if pat == "" {
+		return fmt.Errorf("s: empty pattern")
 	}
 	global := strings.Contains(flags, "g")
-	_ = repl
-	re, err := regexp.Compile(pat)
+
+	// ed pattern escapes -> Go regexp escapes: \<delim> is a literal delim
+	// (and \\c for any other c stays an escape for c)
+	var pb strings.Builder
+	for i := 0; i < len(pat); i++ {
+		if pat[i] == '\\' && i+1 < len(pat) {
+			if pat[i+1] == delim {
+				pb.WriteRune(rune(delim))
+			} else {
+				pb.WriteByte(pat[i])
+				pb.WriteByte(pat[i+1])
+			}
+			i++
+		} else {
+			pb.WriteByte(pat[i])
+		}
+	}
+	re, err := regexp.Compile(pb.String())
 	if err != nil {
 		return err
 	}
-	if pat == "" && re != nil {
-		// empty pattern: reuse last regex? keep simple: error
-		return fmt.Errorf("s: empty pattern")
+
+	// ed replacement -> Go replacement: \\d -> \\d stays (Go uses $n),
+	// \\n (backslash-n in source) -> \\n, & -> $0, \\& -> &, \\<delim> -> delim,
+	// \\c -> c for other c
+	var rb strings.Builder
+	for i := 0; i < len(repl); i++ {
+		if repl[i] == '\\' && i+1 < len(repl) {
+			c := repl[i+1]
+			switch {
+			case c == delim:
+				rb.WriteRune(rune(delim))
+			case c == '&':
+				rb.WriteByte('&')
+			case c == 'n':
+				rb.WriteString("\\n")
+			case c == 't':
+				rb.WriteString("\\t")
+			case c >= '0' && c <= '9':
+				rb.WriteByte('$')
+				rb.WriteByte(c)
+			default:
+				rb.WriteByte(c)
+			}
+			i++
+		} else if repl[i] == '&' {
+			rb.WriteString("$0")
+		} else {
+			rb.WriteByte(repl[i])
+		}
 	}
+	final := rb.String()
+
 	count := 0
 	for i := l1; i <= l2; i++ {
-		if global {
-			nl := re.ReplaceAllString(b.Lines[i-1], repl)
-			if nl != b.Lines[i-1] {
-				b.Lines[i-1] = nl
-				count++
+		nl := re.ReplaceAllString(b.Lines[i-1], final)
+		if !global {
+			// ed default: replace first match only
+			loc := re.FindStringIndex(b.Lines[i-1])
+			if loc == nil {
+				continue
 			}
-		} else {
-			if loc := re.FindStringIndex(b.Lines[i-1]); loc != nil {
-				b.Lines[i-1] = b.Lines[i-1][:loc[0]] + repl + b.Lines[i-1][loc[1]:]
-				count++
-			}
+			nl = b.Lines[i-1][:loc[0]] + re.ReplaceAllString(b.Lines[i-1][loc[0]:loc[1]], final) + b.Lines[i-1][loc[1]:]
+		}
+		if nl != b.Lines[i-1] {
+			b.Lines[i-1] = nl
+			count++
 		}
 	}
 	if count == 0 {

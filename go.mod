@@ -1,6 +1,8 @@
 module ved
 
-go 1.27
+go 1.24.0
+
+toolchain go1.24.9
 
 require (
 	github.com/gdamore/tcell/v2 v2.13.10

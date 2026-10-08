@@ -29,6 +29,12 @@ type Snapshot struct {
 }
 
 // Engine holds buffer, history, snapshots, and current addresses.
+type MoveInfo struct {
+	L1, L2 int  // 1-based source range in the pre-command buffer
+	Dest   int  // destination (block inserted after this line, pre-command coords)
+	Copy   bool // true for t, false for m
+}
+
 type Engine struct {
 	Filename  string
 	Base      *Buffer // pristine buffer as loaded
@@ -41,6 +47,7 @@ type Engine struct {
 	WarnedQuit bool
 	QuitRequested bool
 	LastMsg string
+	LastMove *MoveInfo // set by m/t; nil for any other command
 	ShowNumbers bool // display preference: gutter line numbers
 	Marks map[byte]int // named marks set by k, addressed with 'x
 	HMode bool // auto-print error messages (H toggle)

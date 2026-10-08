@@ -716,11 +716,10 @@ func (u *UI) recomputeModified() {
 		if LastError != "" {
 			eng.LastMsg = LastError
 		} else if strings.HasPrefix(strings.TrimSpace(c.Text), "s") ||
-			strings.HasPrefix(strings.TrimSpace(c.Text), "m") ||
-			strings.HasPrefix(strings.TrimSpace(c.Text), "t") ||
 			strings.HasPrefix(strings.TrimSpace(c.Text), "d") {
 			eng.LastMsg = ""
 		}
+		// m/t keep their "moved/copied X after Y" message
 		if !buffersEqual(b, before) {
 			mod = true
 		}
@@ -744,9 +743,54 @@ func (u *UI) previewBuffer() (*Buffer, *Buffer) {
 	// diff shows what re-applying the edited command would change.
 	eng := u.eng
 	h := &eng.Hist
-	preview := eng.StateAtPreview(h.Cursor, u.currentEdit())
 	base := eng.StateAt(len(h.Cmds))
+	preview := eng.StateAtPreview(h.Cursor, u.currentEdit())
 	return preview, base
+}
+
+// rline is one rendered row in the top pane.
+type rline struct {
+	text    string
+	kind    int // 0 normal, 1 old(red), 2 new(green), 3 moved-from, 4 moved-to
+	styles  []tcell.Style
+	lineNum int // 1-based line number in preview buffer for normal lines
+	oldIdx  int // 0-based index into base buffer for old lines
+}
+
+// overlayMove recolors rows affected by a just-issued m/t command so the
+// preview shows what actually moved instead of an arbitrary delete/insert
+// pair. A block move like 1,3m4 is content-identical to moving the
+// intervening line the other way; only the engine knows which block the
+// user meant.
+func overlayMove(rows []rline, mv *MoveInfo) {
+	if mv == nil {
+		return
+	}
+	size := mv.L2 - mv.L1 + 1
+	newStart := mv.Dest
+	if !mv.Copy {
+		// the block is deleted first; if the destination was after the block,
+		// the insertion point shifts up by the block size (dest can't fall
+		// inside the block — ed forbids that)
+		if mv.Dest > mv.L2 {
+			newStart = mv.Dest - size
+		}
+	}
+	for k := range rows {
+		if mv.Copy {
+			// source lines stay put; only the inserted block is marked
+			if rows[k].lineNum >= newStart+1 && rows[k].lineNum <= newStart+size {
+				rows[k].kind = 4
+			}
+		} else {
+			if rows[k].kind == 1 && rows[k].oldIdx+1 >= mv.L1 && rows[k].oldIdx+1 <= mv.L2 {
+				rows[k].kind = 3
+			}
+			if rows[k].lineNum >= newStart+1 && rows[k].lineNum <= newStart+size {
+				rows[k].kind = 4
+			}
+		}
+	}
 }
 
 func (u *UI) draw() {
@@ -758,16 +802,10 @@ func (u *UI) draw() {
 
 	eng := u.eng
 	preview, base := u.previewBuffer()
-	vedlog(fmt.Sprintf("draw: previewLines=%d curLine=%d cursor=%d cmds=%d lastMsg=%q",
-		preview.NumLines(), eng.CurLine, eng.Hist.Cursor, len(eng.Hist.Cmds), eng.LastMsg))
+	vedlog(fmt.Sprintf("draw: previewLines=%d curLine=%d cursor=%d cmds=%d lastMsg=%q lastMove=%+v edit=%q",
+		preview.NumLines(), eng.CurLine, eng.Hist.Cursor, len(eng.Hist.Cmds), eng.LastMsg, eng.LastMove, u.currentEdit()))
 
 	// Build the render list: merged diff view.
-	type rline struct {
-		text    string
-		kind    int // 0 normal, 1 old(red), 2 new(green)
-		styles  []tcell.Style
-		lineNum int // 1-based line number in preview buffer for normal lines
-	}
 	var rows []rline
 	changes := DiffLine(base.Lines, preview.Lines)
 	ci := 0
@@ -776,7 +814,8 @@ func (u *UI) draw() {
 		if ci < len(changes) && oi >= changes[ci].OldStart && ni >= changes[ci].NewStart {
 			ch := changes[ci]
 			for i := ch.OldStart; i < ch.OldEnd; i++ {
-				rows = append(rows, rline{text: base.Lines[i], kind: 1})
+				// deleted lines keep their pre-edit line numbers
+				rows = append(rows, rline{text: base.Lines[i], kind: 1, oldIdx: i, lineNum: i + 1})
 			}
 			for i := ch.NewStart; i < ch.NewEnd; i++ {
 				rows = append(rows, rline{text: preview.Lines[i], kind: 2, lineNum: i + 1})
@@ -806,6 +845,11 @@ func (u *UI) draw() {
 	if viewTop < 0 {
 		viewTop = 0
 	}
+	// If the current command was an m/t, recolor what actually moved/copied
+	// instead of showing the generic (often misleading) delete/insert pair.
+	if len(changes) > 0 {
+		overlayMove(rows, eng.LastMove)
+	}
 	numW := 0
 	if eng.ShowNumbers {
 		numW = len(fmt.Sprint(len(rows)+1)) + 2 // gutter width: number + two spaces
@@ -826,6 +870,10 @@ func (u *UI) draw() {
 			bodySt = tcell.StyleDefault.Foreground(tcell.ColorRed)
 		case 2:
 			bodySt = tcell.StyleDefault.Foreground(tcell.ColorGreen)
+		case 3:
+			bodySt = tcell.StyleDefault.Foreground(tcell.ColorYellow)
+		case 4:
+			bodySt = tcell.StyleDefault.Foreground(tcell.ColorTeal).Bold(true)
 		default:
 			bodySt = tcell.StyleDefault.Foreground(tcell.ColorDefault)
 		}
@@ -835,6 +883,8 @@ func (u *UI) draw() {
 			prefix = "- "
 		case 2:
 			prefix = "+ "
+		case 3, 4:
+			prefix = "↕ "
 		}
 		if isDot {
 			numSt = numSt.Background(dotBg)
@@ -842,7 +892,7 @@ func (u *UI) draw() {
 		}
 		gutter := ""
 		if eng.ShowNumbers {
-			n := fmt.Sprintf("%*d", numW-2, idx+1)
+			n := fmt.Sprintf("%*d", numW-2, rl.lineNum)
 			gutter = n + "  "
 		}
 		// Style only what can be shown: styling a very long line is wasted
