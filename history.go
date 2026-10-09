@@ -47,6 +47,7 @@ type Engine struct {
 	WarnedQuit bool
 	QuitRequested bool
 	LastMsg string
+	PreviewErr string // live-edit preview error, shown while typing
 	LastMove *MoveInfo // set by m/t; nil for any other command
 	ShowNumbers bool // display preference: gutter line numbers
 	Marks map[byte]int // named marks set by k, addressed with 'x
@@ -113,12 +114,15 @@ func (e *Engine) StateAt(n int) *Buffer {
 func (e *Engine) StateAtPreview(i int, text string) *Buffer {
 	saved := LastError
 	savedMsg := e.LastMsg
+	e.PreviewErr = ""
 	defer func() { LastError = saved; e.LastMsg = savedMsg }()
 	if i >= len(e.Hist.Cmds) {
 		// editing the fresh line: apply new text after all commands
 		b := e.StateAt(len(e.Hist.Cmds) - 1)
 		if strings.TrimSpace(text) != "" {
-			ApplyCommand(b, e, text, true)
+			if err := ApplyCommand(b, e, text, true); err != nil {
+				e.PreviewErr = err.Error()
+			}
 		}
 		return b
 	}
@@ -135,7 +139,9 @@ func (e *Engine) StateAtPreview(i int, text string) *Buffer {
 		ApplyCommand(b, e, e.Hist.Cmds[j].Text, true)
 	}
 	if strings.TrimSpace(text) != "" {
-		ApplyCommand(b, e, text, true)
+		if err := ApplyCommand(b, e, text, true); err != nil {
+			e.PreviewErr = err.Error()
+		}
 	}
 	return b
 }

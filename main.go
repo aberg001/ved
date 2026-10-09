@@ -332,8 +332,13 @@ func (u *UI) handleKey(ev *tcell.EventKey) {
 			u.editRow--
 			u.editCol = len([]rune(u.editLines[u.editRow]))
 		} else if u.appendMode {
-			// moving up out of the append edit: open the collecting command
-			// (which holds the body committed so far) for editing
+			// moving up out of the append edit: fold the in-progress line into
+			// the collecting command so un-committed typing is not lost
+			if text := u.currentEdit(); strings.TrimSpace(text) != "" {
+				u.eng.Hist.Cmds[u.appendIdx].Text += "\n" + text
+			}
+			// then open the collecting command (which now holds the whole
+			// body typed so far) for editing
 			u.historyUp()
 			u.appendMode = false
 			u.editingBody = true
@@ -646,6 +651,11 @@ func (u *UI) commit() {
 	// recompute modified flag: run the timeline with file effects allowed
 	u.recomputeModified()
 	eng.MaybeSnapshot()
+	// engine-level quit (wq) takes effect immediately
+	if eng.QuitRequested {
+		u.quit = true
+		return
+	}
 	// live quit semantics, like ed: plain q warns once on a modified buffer
 	t := strings.TrimSpace(text)
 	if t == "Q" || t == "Q!" || t == "q!" {
@@ -744,7 +754,17 @@ func (u *UI) previewBuffer() (*Buffer, *Buffer) {
 	eng := u.eng
 	h := &eng.Hist
 	base := eng.StateAt(len(h.Cmds))
-	preview := eng.StateAtPreview(h.Cursor, u.currentEdit())
+	edit := u.currentEdit()
+	preview := eng.StateAtPreview(h.Cursor, edit)
+	if u.appendMode && u.appendIdx < len(h.Cmds) && u.appendIdx == h.Cursor {
+		// Up-into-command: edit already holds the full collecting command
+		preview = eng.StateAtPreview(h.Cursor, edit)
+	} else if u.appendMode && u.appendIdx < len(h.Cmds) && strings.TrimSpace(edit) != "" {
+		// typing a fresh body line: fold it into the collecting command and
+		// substitute at that command's index, so the committed part of the
+		// body is not replayed twice (which showed the line twice)
+		preview = eng.StateAtPreview(u.appendIdx, h.Cmds[u.appendIdx].Text+"\n"+edit)
+	}
 	return preview, base
 }
 
@@ -755,6 +775,41 @@ type rline struct {
 	styles  []tcell.Style
 	lineNum int // 1-based line number in preview buffer for normal lines
 	oldIdx  int // 0-based index into base buffer for old lines
+}
+
+// editIsSub reports whether the pending command is a substitute (s), so the
+// diff can be rendered characterwise: changed chars highlighted, common
+// parts left plain.
+func (u *UI) editIsSub() bool {
+	e := u.currentEdit()
+	if u.appendMode && u.appendIdx < len(u.eng.Hist.Cmds) {
+		e = u.eng.Hist.Cmds[u.appendIdx].Text + "\n" + e
+	}
+	if len(e) < 2 || e[0] != 's' {
+		return false
+	}
+	switch e[1] {
+	case '/', '|', '^', ',', '%', '@', ';', '#':
+		return true
+	}
+	return false
+}
+
+// charDiffPair computes rune-indexed styles for an old/new line pair:
+// deleted ranges on the old line get delSt, inserted ranges on the new
+// line get addSt; common characters keep their syntax style.
+func charDiffPair(oldText, newText string, syn *Syntax, delSt, addSt, bodySt tcell.Style) (oldSt, newSt []tcell.Style) {
+	baseOld := LineStyles(oldText, syn, bodySt)
+	baseNew := LineStyles(newText, syn, bodySt)
+	for _, ch := range DiffRunes([]rune(oldText), []rune(newText)) {
+		for i := ch.OldStart; i < ch.OldEnd && i < len(baseOld); i++ {
+			baseOld[i] = delSt
+		}
+		for i := ch.NewStart; i < ch.NewEnd && i < len(baseNew); i++ {
+			baseNew[i] = addSt
+		}
+	}
+	return baseOld, baseNew
 }
 
 // overlayMove recolors rows affected by a just-issued m/t command so the
@@ -802,11 +857,12 @@ func (u *UI) draw() {
 
 	eng := u.eng
 	preview, base := u.previewBuffer()
-	vedlog(fmt.Sprintf("draw: previewLines=%d curLine=%d cursor=%d cmds=%d lastMsg=%q lastMove=%+v edit=%q",
-		preview.NumLines(), eng.CurLine, eng.Hist.Cursor, len(eng.Hist.Cmds), eng.LastMsg, eng.LastMove, u.currentEdit()))
+	vedlog(fmt.Sprintf("draw: previewLines=%d curLine=%d cursor=%d cmds=%d lastMsg=%q perr=%q edit=%q",
+		preview.NumLines(), eng.CurLine, eng.Hist.Cursor, len(eng.Hist.Cmds), eng.LastMsg, eng.PreviewErr, u.currentEdit()))
 
 	// Build the render list: merged diff view.
 	var rows []rline
+	syn := u.syn.For(eng.Filename)
 	changes := DiffLine(base.Lines, preview.Lines)
 	ci := 0
 	oi, ni := 0, 0
@@ -820,6 +876,16 @@ func (u *UI) draw() {
 			for i := ch.NewStart; i < ch.NewEnd; i++ {
 				rows = append(rows, rline{text: preview.Lines[i], kind: 2, lineNum: i + 1})
 			}
+			// characterwise diff for substitute commands: one old line replaced
+			// by one new line gets per-character highlighting instead of two
+			// fully colored rows
+			if ch.OldEnd-ch.OldStart == 1 && ch.NewEnd-ch.NewStart == 1 && u.editIsSub() {
+				delSt := tcell.StyleDefault.Foreground(tcell.ColorRed)
+				addSt := tcell.StyleDefault.Foreground(tcell.ColorGreen)
+				rows[len(rows)-2].styles, rows[len(rows)-1].styles = charDiffPair(
+					base.Lines[ch.OldStart], preview.Lines[ch.NewStart], syn, delSt, addSt,
+					tcell.StyleDefault.Foreground(tcell.ColorDefault))
+			}
 			oi, ni = ch.OldEnd, ch.NewEnd
 			ci++
 			continue
@@ -831,7 +897,6 @@ func (u *UI) draw() {
 		}
 	}
 	// vertical scroll: keep current line visible
-	syn := u.syn.For(eng.Filename)
 	viewTop := 0
 	if eng.CurLine > 0 {
 		viewTop = eng.CurLine - topRows/2
@@ -922,6 +987,9 @@ func (u *UI) draw() {
 				st = bodySt
 			} else if rl.kind == 0 {
 				st = bodyStyles[i-prefixR]
+			} else if rl.styles != nil && i-prefixR >= 0 && i-prefixR < len(rl.styles) {
+				// characterwise diff rows: per-char styles from the s diff
+				st = rl.styles[i-prefixR]
 			}
 			styles[i] = st
 		}
@@ -936,14 +1004,23 @@ func (u *UI) draw() {
 	if eng.LastMsg != "" && eng.LastMsg == LastError {
 		statusSt = tcell.StyleDefault.Background(tcell.ColorDarkRed).Foreground(tcell.ColorWhite).Bold(true)
 	}
+	// while a command is being edited, the status shows the live preview
+	// error, or hides any stale error from a previous keystroke
+	editing := u.currentEdit() != ""
+	if editing && eng.PreviewErr != "" {
+		statusSt = tcell.StyleDefault.Background(tcell.ColorDarkRed).Foreground(tcell.ColorWhite).Bold(true)
+	}
 	status := fmt.Sprintf(" %s%s | %d lines, %d words, %d chars | cmd %d/%d",
 		eng.Filename, modMark(eng.Modified), preview.NumLines(), preview.WordCount(),
 		preview.CharCount(), u.eng.Hist.Cursor, len(u.eng.Hist.Cmds))
-	if eng.LastMsg != "" {
+	switch {
+	case editing && eng.PreviewErr != "":
+		status = " " + eng.PreviewErr
+	case eng.LastMsg != "":
 		status = " " + eng.LastMsg
-		if r := []rune(status); len(r) > w {
-			status = string(r[:w])
-		}
+	}
+	if r := []rune(status); len(r) > w {
+		status = string(r[:w])
 	}
 	for x := 0; x < w; x++ {
 		r, _, _ := statusSt.Decompose()
@@ -1089,14 +1166,14 @@ func (u *UI) drawCmdPane(top, height, width int) {
 		st := tcell.StyleDefault
 		if pr.current {
 			if pr.body {
-				st = st.Foreground(tcell.ColorYellow)
+				st = st.Foreground(theme.HistCur)
 			} else {
-				st = st.Foreground(tcell.ColorYellow).Bold(true)
+				st = st.Foreground(theme.HistCur).Bold(true)
 			}
 		} else if pr.body {
-			st = st.Foreground(tcell.ColorTeal)
+			st = st.Foreground(theme.HistBody)
 		} else {
-			st = st.Foreground(tcell.ColorGray)
+			st = st.Foreground(theme.HistHint)
 		}
 		drawText(s, 0, top+r, width, pr.text, st)
 	}

@@ -13,7 +13,16 @@ type Change struct {
 // Uses LCS dynamic programming; falls back to coarse whole-buffer diff
 // for very large buffers to keep it fast.
 func DiffLine(old, new []string) []Change {
-	const maxCells = 4_000_000
+	return lcsChanges(old, new, 4_000_000)
+}
+
+// DiffRunes computes character-level changes between two runes slices
+// (e.g. old and new text of a single line), for intra-line highlighting.
+func DiffRunes(old, new []rune) []Change {
+	return lcsChanges(old, new, 1_000_000)
+}
+
+func lcsChanges[T comparable](old, new []T, maxCells int) []Change {
 	if len(old)*len(new) > maxCells {
 		// coarse: find common prefix/suffix, everything else is one change
 		p := 0

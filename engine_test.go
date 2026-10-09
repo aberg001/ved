@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -89,5 +90,40 @@ func TestExHelp(t *testing.T) {
 	handleExCommand(e, "help nope", false)
 	if !strings.Contains(LastError, "no help for: nope") {
 		t.Fatalf("unknown topic: LastError=%q", LastError)
+	}
+}
+
+// wq writes the buffer then quits; a failed write must not quit.
+func TestWQ(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/out.txt"
+
+	// success: writes and requests quit
+	b := NewBuffer()
+	b.Lines = []string{"one", "two"}
+	e := NewEngine(path, b)
+	if err := ApplyCommand(b, e, "wq", false); err != nil {
+		t.Fatalf("wq: %v", err)
+	}
+	data, _ := os.ReadFile(path)
+	if got := string(data); got != "one\ntwo\n" {
+		t.Fatalf("wq wrote %q", got)
+	}
+	if !e.QuitRequested {
+		t.Fatal("wq did not request quit")
+	}
+	if e.Modified {
+		t.Fatal("wq left buffer marked modified")
+	}
+
+	// failure: unwritable path quits nothing
+	b2 := NewBuffer()
+	b2.Lines = []string{"one"}
+	e2 := NewEngine("", b2)
+	if err := ApplyCommand(b2, e2, "wq "+dir+"/no/such/dir/f", false); err == nil {
+		t.Fatal("expected write error")
+	}
+	if e2.QuitRequested {
+		t.Fatal("failed wq must not request quit")
 	}
 }

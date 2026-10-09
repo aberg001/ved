@@ -295,12 +295,45 @@ func applyCommand(b *Buffer, e *Engine, text string, live bool) error {
 	c := rest[0]
 	if c == ':' {
 		// extension command: strip the ':' prefix before dispatching
-		rest = strings.TrimLeft(rest[1:], " \t")
-		c = ':'
+		next := strings.TrimLeft(rest[1:], " \t")
+		if next == "" {
+			// just ':' (mid-typing preview): no-op
+			return nil
+		}
+		rest = next
 	}
-	arg := ""
-	if len(rest) > 1 {
+	// arg follows the whole command word, so "wq" leaves arg empty
+	// while "wq file" leaves "file"
+	cmdWord := rest
+	if i := strings.IndexAny(rest, " \t"); i >= 0 {
+		cmdWord = rest[:i]
+	}
+	var arg string
+	if c == ':' {
 		arg = strings.TrimLeft(rest[1:], " \t")
+	} else if cmdWord == "wq" {
+		// wq takes an optional filename: "wq" leaves arg empty,
+		// "wq file" leaves "file"
+		arg = strings.TrimLeft(rest[len(cmdWord):], " \t")
+	} else {
+		arg = strings.TrimLeft(rest[1:], " \t")
+	}
+	if cmdWord == "wq" {
+		if live {
+			return nil
+		}
+		fname := arg
+		if fname == "" {
+			fname = e.Filename
+		}
+		data := strings.Join(b.Lines, "\n") + "\n"
+		if err := os.WriteFile(fname, []byte(data), 0644); err != nil {
+			LastError = err.Error()
+			return err
+		}
+		e.Modified = false
+		e.QuitRequested = true
+		return nil
 	}
 	switch c {
 	case 'a':
@@ -374,6 +407,10 @@ func applyCommand(b *Buffer, e *Engine, text string, live bool) error {
 		}
 		e.LastMove = &MoveInfo{L1: l1, L2: l2, Dest: origDest, Copy: false}
 	case 't':
+		if l1 < 1 || l2 > len(b.Lines) {
+			LastError = "address out of range"
+			return fmt.Errorf("%s", LastError)
+		}
 		dest, err := parseSingle(arg, e, b)
 		if err != nil {
 			LastError = err.Error()
@@ -771,9 +808,12 @@ func doSubstitute(b *Buffer, arg string, l1, l2 int) error {
 		return sb.String(), s, false
 	}
 
-	pat, tail, _ := split(rest)
+	pat, tail, patEnded := split(rest)
 	repl, flags, ended := split(tail)
-	if !ended {
+	if !patEnded {
+		// still typing the pattern: replacement is nothing yet
+		repl, flags = "", ""
+	} else if !ended {
 		// still being typed: pattern complete, replacement is whatever
 		// is on screen so far, no flags yet
 		flags = ""
@@ -1023,7 +1063,7 @@ var helpTopics = map[string]string{
 	"Q":    "Q — quit unconditionally, even if the buffer is modified",
 	".":    ". — address: the current line (dot); typed alone, prints it",
 	"$":    "$ — address: the last line of the buffer",
-	"set":  ":set nu|nonu — toggle line numbers in the buffer pane",
+	"set":  ":set nu|nonu|lightmode|darkmode — toggle numbers or color theme",
 	"help": ":help [cmd] — show usage for cmd; no arg lists all commands",
 	"g":    "[addr] g/pat/cmd — run cmd on lines matching pat (default: whole buffer)",
 	"v":    "[addr] v/pat/cmd — run cmd on lines NOT matching pat",
@@ -1075,6 +1115,10 @@ func handleExCommand(e *Engine, rest string, live bool) {
 			e.ShowNumbers = true
 		case "nonu", "nonumber":
 			e.ShowNumbers = false
+		case "lightmode", "light":
+			setLightMode(true)
+		case "darkmode", "dark":
+			setLightMode(false)
 		default:
 			LastError = "unknown option: " + f[1]
 		}
@@ -1082,3 +1126,4 @@ func handleExCommand(e *Engine, rest string, live bool) {
 		LastError = "unknown command: :" + f[0]
 	}
 }
+
